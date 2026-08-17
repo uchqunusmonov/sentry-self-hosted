@@ -1,0 +1,24 @@
+name: Enforce License Compliance
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  enforce-license-compliance:
+    if: github.repository_owner == 'getsentry'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Enforce License Compliance'
+        uses: getsentry/action-enforce-license-compliance@main
+        with:
+          fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
