@@ -2,8 +2,12 @@
 
 Production deployment of self-hosted Sentry, managed as a Git repository.
 
-Public endpoint (once the reverse proxy is added): **https://sentry.ilmiy.uz**
-Container stack listens on: **127.0.0.1:9000** (loopback only)
+Access: **http://&lt;server-ip&gt;:9000** — internal network, plaintext HTTP, no TLS.
+Container stack binds: **0.0.0.0:9000** (all interfaces)
+
+> This is a deliberate choice. The deployment and the projects reporting to it
+> all live on an internal network. See §5 for the security boundary this
+> assumes, and §10 for what to change if the host ever becomes public.
 
 ---
 
@@ -160,7 +164,7 @@ Both live in `deploy/env.base`:
 | Key | Upstream default | Ours | Reason |
 |---|---|---|---|
 | `SENTRY_EVENT_RETENTION_DAYS` | `90` | `30` | Requested retention window. |
-| `SENTRY_BIND` | `9000` | `127.0.0.1:9000` | Upstream's bare `9000` publishes on `0.0.0.0`, exposing Sentry to the internet. Loopback keeps the reverse proxy as the only public entry point. |
+| `SENTRY_BIND` | `9000` | `0.0.0.0:9000` | Reachable at `http://<server-ip>:9000` from the internal network. Explicit form instead of upstream's bare `9000` so the intent is stated rather than implied. |
 
 `install/_lib.sh` reads `.env.custom` first and merges it over `.env`, so only
 the keys we actually change need to be listed.
@@ -263,7 +267,8 @@ docker compose run --rm web createuser --superuser
 ```bash
 docker compose ps
 ./deploy/verify.sh
-curl -I http://127.0.0.1:9000
+curl -I http://127.0.0.1:9000          # from the server itself
+curl -I http://<server-ip>:9000        # from another host on the network
 ```
 
 ### Start / stop / restart
@@ -400,26 +405,69 @@ dump from step 2. This is why the backup comes before anything else.
 
 ---
 
-## 10. Next step: reverse proxy and HTTPS
+## 10. Network exposure and the security boundary
 
-Not part of this deployment. The stack deliberately listens on loopback only, so
-Sentry is unreachable from outside until a proxy is placed in front.
+This deployment runs **plaintext HTTP on all interfaces**, by design, because it
+sits on an internal network and the projects reporting to it use internal IPs.
 
-Outline for `https://sentry.ilmiy.uz`:
+### What that assumes
 
-1. Point the `sentry.ilmiy.uz` DNS A record at the server.
-2. Open ports 80 and 443 in the firewall. **Leave 9000 closed.**
-3. Install nginx on the host and proxy to `http://127.0.0.1:9000`.
-4. Issue a certificate with certbot (`--nginx`), confirm auto-renewal.
-5. In `sentry/config.yml` set `system.url-prefix: 'https://sentry.ilmiy.uz'`,
-   then `docker compose restart web`. Without this, links in emails and the
-   OAuth/SSO redirect flow point at the wrong host.
-6. Forward the real client IP and scheme (`X-Forwarded-For`,
-   `X-Forwarded-Proto`) or Sentry will attribute every event to the proxy.
-7. Raise `client_max_body_size` — the default 1 MB rejects large source maps and
-   minidumps. 100 MB is a reasonable starting point.
+Everything below travels unencrypted and is readable by anything on the network
+path:
 
----
+- login credentials and session cookies
+- DSN keys and auth tokens
+- event payloads — stack traces, request data, and whatever user data your
+  projects attach to them
+
+That is an acceptable trade **only** while port 9000 stays inside the trusted
+network. The whole security model rests on that one condition.
+
+### Keep the boundary intact
+
+```bash
+sudo ufw status                      # confirm 9000 is not open at the perimeter
+ss -lntp | grep 9000                 # confirm what is actually bound
+```
+
+Rules of thumb:
+
+- Do not port-forward or NAT 9000 to a public address.
+- Do not put the host on a public interface without revisiting this section.
+- `deploy/verify.sh` prints the reminder and the internal URL on every run.
+
+### Set the URL prefix
+
+After the first install, point Sentry at the address people actually use.
+Without this, links in notification emails and any SSO redirect go to the wrong
+host.
+
+```bash
+# sentry/config.yml
+system.url-prefix: 'http://<server-ip>:9000'
+```
+
+```bash
+docker compose restart web
+```
+
+Prefer a stable internal DNS name over a raw IP if you have one — it survives
+the server changing address.
+
+### If this ever needs to face the internet
+
+The change is small, and the order matters:
+
+1. `deploy/env.base` → `SENTRY_BIND=127.0.0.1:9000`, then
+   `./deploy/bootstrap.sh && docker compose up -d`.
+2. Point DNS at the host; open 80 and 443, keep 9000 closed.
+3. Install nginx on the host, proxy to `http://127.0.0.1:9000`.
+4. Issue a certificate with certbot (`--nginx`); confirm auto-renewal.
+5. Update `system.url-prefix` to the `https://` address, restart `web`.
+6. Forward `X-Forwarded-For` and `X-Forwarded-Proto`, or Sentry attributes every
+   event to the proxy.
+7. Raise `client_max_body_size` — nginx's 1 MB default rejects large source maps
+   and minidumps. 100 MB is a reasonable start.
 
 ## 11. Reference
 
